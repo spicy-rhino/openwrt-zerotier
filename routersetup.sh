@@ -1,9 +1,9 @@
-cat > /root/routersetup.sh <<'SH'
 #!/bin/ash
-# OpenWrt 24.10.0 (RPi5) — LuCI + extras + ZeroTier (ash-safe)
+# OpenWrt 24.10.0 (RPi5) — LuCI + extras + ZeroTier (ash-safe, auto-detect zerotier-cli)
 
 set -eu
 
+# --- Packages ---
 PKGS_LUCI="luci luci-ssl luci-compat luci-app-opkg"
 PKGS_ZT="zerotier"
 PKGS_USB="kmod-rt2800-lib kmod-rt2800-usb kmod-rt2x00-lib kmod-rt2x00-usb \
@@ -11,9 +11,13 @@ kmod-usb-core kmod-usb-uhci kmod-usb-ohci kmod-usb2 usbutils nano \
 kmod-usb-net-asix-ax88179 kmod-usb-net-cdc-ether kmod-usb-net-rndis"
 PKGS="$PKGS_LUCI $PKGS_ZT $PKGS_USB"
 
-ZTCLI="/usr/sbin/zerotier-cli"
+# Will be set by detect_ztcli()
+ZTCLI=""
+
+RETRIES=3
 
 log()  { printf '[+] %s\n' "$*"; }
+warn() { printf '[~] %s\n' "$*" >&2; }
 err()  { printf '[!] %s\n' "$*" >&2; }
 
 retry() { # retry <times> <cmd...>
@@ -28,6 +32,7 @@ retry() { # retry <times> <cmd...>
 }
 
 is_installed() { opkg list-installed | grep -q "^$1 -"; }
+pkg_available() { opkg info "$1" >/dev/null 2>&1; }
 
 ensure_time_sync() {
   [ -x /etc/init.d/sysntpd ] && {
@@ -60,7 +65,7 @@ prompt_network_id_blocking() {
       err "No TTY available for input. Re-run from an interactive shell."
       exit 2
     fi
-    # normalize (strip whitespace, lowercase A-F)
+    # Normalize: strip whitespace, lowercase hex
     ZT_NETWORK_ID="$(printf '%s' "$ZT_NETWORK_ID" | tr -d ' \t\r\n' | tr 'A-F' 'a-f')"
 
     case "$ZT_NETWORK_ID" in
@@ -79,14 +84,40 @@ prompt_network_id_blocking() {
   done
 }
 
+detect_ztcli() {
+  if command -v zerotier-cli >/dev/null 2>&1; then
+    ZTCLI="$(command -v zerotier-cli)"
+  elif [ -x /usr/bin/zerotier-cli ]; then
+    ZTCLI="/usr/bin/zerotier-cli"
+  elif [ -x /usr/sbin/zerotier-cli ]; then
+    ZTCLI="/usr/sbin/zerotier-cli"
+  else
+    ZTCLI=""
+  fi
+  export ZTCLI
+}
+
 ensure_zerotier_running() {
-  [ -x "$ZTCLI" ] || { err "zerotier-cli not found at $ZTCLI"; return 1; }
+  detect_ztcli
+  if [ -z "$ZTCLI" ]; then
+    log "ZeroTier CLI not found; installing package..."
+    retry "$RETRIES" opkg update || true
+    retry "$RETRIES" opkg install zerotier || {
+      err "Failed to install 'zerotier'."
+      return 1
+    }
+    detect_ztcli
+  fi
+
+  [ -n "$ZTCLI" ] || { err "zerotier-cli still not found after install."; return 1; }
+
   [ -x /etc/init.d/zerotier ] && {
     /etc/init.d/zerotier enable || true
     /etc/init.d/zerotier restart || /etc/init.d/zerotier start || true
   }
+
   retry 5 "$ZTCLI" info >/dev/null 2>&1 || {
-    err "ZeroTier service not responding to 'zerotier-cli info'"
+    err "ZeroTier service not responding to '$ZTCLI info'."
     return 1
   }
   return 0
@@ -95,11 +126,15 @@ ensure_zerotier_running() {
 join_zerotier() {
   log "Joining ZeroTier network: $ZT_NETWORK_ID"
   ensure_zerotier_running || { err "ZeroTier isn't running; cannot join."; return 1; }
-  retry 3 "$ZTCLI" join "$ZT_NETWORK_ID" || { err "Failed to join $ZT_NETWORK_ID"; return 1; }
 
-  # brief status info
+  retry "$RETRIES" "$ZTCLI" join "$ZT_NETWORK_ID" || {
+    err "Failed to join $ZT_NETWORK_ID"
+    return 1
+  }
+
+  # Brief status
   sleep 2
-  $ZTCLI listnetworks | grep "$ZT_NETWORK_ID" || true
+  "$ZTCLI" listnetworks | grep "$ZT_NETWORK_ID" || true
   echo
   echo "If the network requires controller authorization, approve this node in the ZeroTier web UI."
   echo "Leave later:  $ZTCLI leave $ZT_NETWORK_ID"
@@ -111,7 +146,9 @@ main() {
   ensure_time_sync
 
   log "Updating package lists..."
-  retry 3 opkg update || { err "opkg update failed"; exit 1; }
+  if ! retry "$RETRIES" opkg update; then
+    err "opkg update failed"; exit 1
+  fi
 
   [ -f /var/lock/opkg.lock ] && { err "Another opkg process is running (opkg.lock present)."; exit 1; }
 
@@ -119,8 +156,12 @@ main() {
     if is_installed "$p"; then
       log "Package '$p' already installed; skipping."
     else
-      log "Installing '$p'..."
-      retry 3 opkg install "$p" || { err "Failed to install '$p'"; exit 1; }
+      if pkg_available "$p"; then
+        log "Installing '$p'..."
+        retry "$RETRIES" opkg install "$p" || { err "Failed to install '$p'"; exit 1; }
+      else
+        warn "Package '$p' not available for this target; skipping."
+      fi
     fi
   done
 
@@ -128,7 +169,7 @@ main() {
   [ -x /etc/init.d/uhttpd ] && { /etc/init.d/uhttpd enable || true; /etc/init.d/uhttpd restart || /etc/init.d/uhttpd start || true; }
   [ -x /etc/init.d/rpcd ]   && { /etc/init.d/rpcd   enable || true; /etc/init.d/rpcd   restart || /etc/init.d/rpcd   start || true; }
 
-  # Prompt & join ZT
+  # Prompt & join ZeroTier
   prompt_network_id_blocking
   join_zerotier || true
 
@@ -144,5 +185,3 @@ main() {
 }
 
 main "$@"
-SH
-chmod +x /root/routersetup.sh
