@@ -1,7 +1,5 @@
-cat > /root/routersetup.sh <<'SH'
 #!/bin/ash
-# OpenWrt 24.10.0 (RPi5) — LuCI + extras + ZeroTier (ash-safe, auto-detect zerotier-cli, UCI enable)
-
+# OpenWrt 24.10.0 (RPi5) — Baseline 1 (+ WWAN DNS + zerotier iface)
 set -eu
 
 PKGS_LUCI="luci luci-ssl luci-compat luci-app-opkg"
@@ -11,6 +9,7 @@ kmod-usb-core kmod-usb-uhci kmod-usb-ohci kmod-usb2 usbutils nano \
 kmod-usb-net-asix-ax88179 kmod-usb-net-cdc-ether kmod-usb-net-rndis"
 PKGS="$PKGS_LUCI $PKGS_ZT $PKGS_USB"
 
+VERSION="baseline-1"
 ZTCLI=""
 RETRIES=3
 
@@ -19,12 +18,28 @@ warn() { printf '[~] %s\n' "$*" >&2; }
 err()  { printf '[!] %s\n' "$*" >&2; }
 
 retry() { _t="$1"; shift; n=1; while :; do if "$@"; then return 0; fi; [ $n -ge $_t ] && return 1; n=$((n+1)); sleep 2; done; }
-
 is_installed() { opkg list-installed | grep -q "^$1 -"; }
 pkg_available() { opkg info "$1" >/dev/null 2>&1; }
 
 ensure_time_sync() {
   [ -x /etc/init.d/sysntpd ] && { /etc/init.d/sysntpd enable >/dev/null 2>&1 || true; /etc/init.d/sysntpd start >/dev/null 2>&1 || true; }
+}
+
+configure_wwan_dns() {
+  # Set WWAN DNS to 1.1.1.1 (disable peerdns). Create wwan iface if missing.
+  if uci show network 2>/dev/null | grep -q '^network\.wwan='; then
+    :
+  else
+    sec="$(uci add network interface)"
+    uci set "network.$sec.proto='dhcp'"
+    uci -q rename "network.$sec=wwan"
+  fi
+  uci set network.wwan.peerdns='0'
+  uci -q delete network.wwan.dns 2>/dev/null || true
+  uci add_list network.wwan.dns='1.1.1.1'
+  uci commit network
+  /etc/init.d/network reload >/dev/null 2>&1 || true
+  log "WWAN DNS set to 1.1.1.1 (peerdns=0)."
 }
 
 get_lan_ip() {
@@ -36,13 +51,11 @@ get_lan_ip() {
 }
 
 prompt_network_id_blocking() {
-  echo
-  echo "==============================================================" > /dev/tty
+  echo; echo "==============================================================" > /dev/tty
   echo "   ACTION REQUIRED: Enter ZeroTier NETWORK ID to continue      " > /dev/tty
   echo "   (Find it at https://my.zerotier.com under your network.)    " > /dev/tty
   echo "   Expected format: 16 hex characters (e.g., 8056c2e21c000001) " > /dev/tty
-  echo "==============================================================" > /dev/tty
-  echo > /dev/tty
+  echo "==============================================================" > /dev/tty; echo > /dev/tty
   while :; do
     printf "ZeroTier Network ID: " > /dev/tty
     if ! read ZT_NETWORK_ID < /dev/tty; then err "No TTY available for input."; exit 2; fi
@@ -68,7 +81,6 @@ detect_ztcli() {
 }
 
 uci_enable_zerotier() {
-  # Ensure at least one 'zerotier' section exists and set enabled=1 on all
   if ! uci show zerotier 2>/dev/null | grep -q '=zerotier'; then
     uci add zerotier zerotier >/dev/null
   fi
@@ -87,12 +99,42 @@ ensure_zerotier_running() {
     detect_ztcli
   fi
   [ -n "$ZTCLI" ] || { err "zerotier-cli not found."; return 1; }
-
   uci_enable_zerotier
   [ -x /etc/init.d/zerotier ] && { /etc/init.d/zerotier enable || true; /etc/init.d/zerotier restart || /etc/init.d/zerotier start || true; }
-
   retry 5 "$ZTCLI" info >/dev/null 2>&1 || { err "ZeroTier service not responding to '$ZTCLI info'."; return 1; }
   return 0
+}
+
+detect_zt_device() {
+  # Try to get the zt* dev from listnetworks, else fall back to ip link
+  dev="$("$ZTCLI" listnetworks 2>/dev/null | awk -v id="$ZT_NETWORK_ID" '
+    $0 ~ id {
+      for (i=1;i<=NF;i++) if ($i ~ /^zt[0-9a-f]{10}$/) { print $i; exit }
+    }')"
+  if [ -z "${dev:-}" ]; then
+    dev="$(ip -o link show | awk -F': ' '/: zt[0-9a-f]{10}:/{print $2; exit}' 2>/dev/null || true)"
+  fi
+  printf '%s' "${dev:-}"
+}
+
+create_zerotier_interface() {
+  dev="$(detect_zt_device)"
+  if [ -z "$dev" ]; then
+    warn "ZeroTier device not found yet; skipping interface creation."
+    return 0
+  fi
+  if uci show network 2>/dev/null | grep -q '^network\.zerotier='; then
+    uci set network.zerotier.proto='none'
+    uci set network.zerotier.device="$dev"
+  else
+    sec="$(uci add network interface)"
+    uci set "network.$sec.proto='none'"
+    uci set "network.$sec.device=$dev"
+    uci -q rename "network.$sec=zerotier"
+  fi
+  uci commit network
+  /etc/init.d/network reload >/dev/null 2>&1 || true
+  log "Created interface 'zerotier' (proto none, device $dev)."
 }
 
 join_zerotier() {
@@ -101,14 +143,18 @@ join_zerotier() {
   retry "$RETRIES" "$ZTCLI" join "$ZT_NETWORK_ID" || { err "Failed to join $ZT_NETWORK_ID"; return 1; }
   sleep 2
   "$ZTCLI" listnetworks | grep "$ZT_NETWORK_ID" || true
-  echo
-  echo "If the network requires controller authorization, approve this node in the ZeroTier web UI."
-  echo "Leave later:  $ZTCLI leave $ZT_NETWORK_ID"
-  echo
+  create_zerotier_interface
+  echo; echo "If the network requires controller authorization, approve this node in the ZeroTier web UI."
+  echo "Leave later:  $ZTCLI leave $ZT_NETWORK_ID"; echo
 }
 
 main() {
+  log "Version: $VERSION"
   log "Ensuring time sync..."; ensure_time_sync
+
+  # === WWAN DNS step (requested) ===
+  configure_wwan_dns
+
   log "Updating package lists..."; retry "$RETRIES" opkg update || { err "opkg update failed"; exit 1; }
   [ -f /var/lock/opkg.lock ] && { err "Another opkg process is running (opkg.lock present)."; exit 1; }
 
@@ -138,7 +184,3 @@ main() {
 }
 
 main "$@"
-SH
-chmod +x /root/routersetup.sh
-ash -n /root/routersetup.sh   # syntax check (no output if OK)
-sh /root/routersetup.sh
