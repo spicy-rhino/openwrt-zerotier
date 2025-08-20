@@ -61,16 +61,27 @@ prompt_network_id_blocking() {
   while :; do
     printf "ZeroTier Network ID: " > /dev/tty
     if ! read ZT_NETWORK_ID < /dev/tty; then
-      err "No TTY available for input. Re-run from an interactive shell."
+      echo "[!] No TTY available for input. Re-run from an interactive shell." >&2
       exit 2
     fi
-    ZT_NETWORK_ID="$(printf '%s' "$ZT_NETWORK_ID" | tr 'A-F' 'a-f' | tr -d '[:space:]')"
-    if echo "$ZT_NETWORK_ID" | grep -Eq '^[0-9a-f]{16}$'; then
-      export ZT_NETWORK_ID
-      break
-    else
-      echo "Invalid network ID. Must be 16 hex chars (0-9, a-f). Try again." > /dev/tty
-    fi
+
+    # Normalize & strip whitespace (BusyBox-safe)
+    ZT_NETWORK_ID="$(printf '%s' "$ZT_NETWORK_ID" | tr -d ' \t\r\n' | tr 'A-F' 'a-f')"
+
+    # Validate: only hex, length exactly 16
+    case "$ZT_NETWORK_ID" in
+      (*[!0-9a-f]*|''))
+        echo "Invalid network ID. Must be 16 hex chars (0-9, a-f). Try again." > /dev/tty
+        ;;
+      (*)
+        if [ ${#ZT_NETWORK_ID} -ne 16 ]; then
+          echo "Invalid network ID. Must be exactly 16 characters. Try again." > /dev/tty
+        else
+          export ZT_NETWORK_ID
+          break
+        fi
+        ;;
+    esac
   done
 }
 
