@@ -1,7 +1,8 @@
 #!/bin/ash
-# OpenWrt 24.10.0 (RPi5) — LuCI + extras + ZeroTier (ash-safe)
+# OpenWrt 24.10.0 (RPi5) — LuCI + extras + ZeroTier
 # Baseline 1.2 = Baseline 1.1 + fetch zerotiersetup.sh via curl
-#                + expanded USB/Ethernet driver set
+#              + expanded USB/Ethernet drivers
+#              + tiny hardening: ensure a Zerotier UCI section exists & enabled
 
 set -eu
 
@@ -91,13 +92,15 @@ detect_ztcli() {
   export ZTCLI
 }
 
-uci_enable_zerotier() {
-  if ! uci show zerotier 2>/dev/null | grep -q '=zerotier'; then
-    uci add zerotier zerotier >/dev/null
+# --- Tiny hardening: guarantee /etc/config/zerotier has an enabled section ---
+uci_force_enable_zerotier() {
+  uci -q show zerotier >/dev/null 2>&1 || uci add zerotier zerotier >/dev/null
+  # ensure at least one section exists
+  if ! uci -q get zerotier.@zerotier[0].enabled >/dev/null 2>&1; then
+    # if no [0] section, add one
+    [ -n "$(uci -q show zerotier | sed -n 's/^zerotier\.\([^.]*\)=zerotier.*/\1/p' | head -n1)" ] || uci add zerotier zerotier >/dev/null
   fi
-  for s in $(uci show zerotier | sed -n 's/^\(zerotier\.[^.]*\)=zerotier.*/\1/p'); do
-    uci set $s.enabled='1'
-  done
+  uci set zerotier.@zerotier[0].enabled='1'
   uci commit zerotier
 }
 
@@ -110,7 +113,7 @@ ensure_zerotier_running() {
     detect_ztcli
   fi
   [ -n "$ZTCLI" ] || { err "zerotier-cli not found."; return 1; }
-  uci_enable_zerotier
+  uci_force_enable_zerotier
   [ -x /etc/init.d/zerotier ] && { /etc/init.d/zerotier enable || true; /etc/init.d/zerotier restart || /etc/init.d/zerotier start || true; }
   retry 5 "$ZTCLI" info >/dev/null 2>&1 || { err "ZeroTier service not responding to '$ZTCLI info'."; return 1; }
   return 0
