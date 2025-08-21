@@ -1,19 +1,28 @@
 #!/bin/ash
 # OpenWrt 24.10.0 (RPi5) — LuCI + extras + ZeroTier (ash-safe)
-# Baseline 1.2 = Baseline 1.1 + fetch zerotiersetup.sh via curl
+# Baseline 1.3 = 1.2 + consolidated USB NIC drivers
 
 set -eu
 
 PKGS_LUCI="luci luci-ssl luci-compat luci-app-opkg"
 PKGS_ZT="zerotier"
-PKGS_USB="kmod-rt2800-lib kmod-rt2800-usb kmod-rt2x00-lib kmod-rt2x00-usb \
-kmod-usb-core kmod-usb-uhci kmod-usb-ohci kmod-usb2 usbutils nano \
-kmod-usb-net-asix-ax88179 kmod-usb-net-cdc-ether kmod-usb-net-rndis"
+# Consolidated USB + NIC drivers (superset)
+PKGS_USB="\
+kmod-usb-core kmod-usb-uhci kmod-usb-ohci kmod-usb2 kmod-usb3 \
+usbutils nano ethtool \
+kmod-rt2x00-lib kmod-rt2x00-usb kmod-rt2800-lib kmod-rt2800-usb \
+kmod-usb-net-cdc-ether kmod-usb-net-rndis kmod-usb-net-cdc-ncm \
+kmod-usb-net-ax88179-178a kmod-usb-net-asix-ax88179 kmod-usb-net-asix \
+kmod-usb-net-rtl8152 kmod-usb-net-rtl8150 \
+kmod-usb-net-smsc95xx kmod-usb-net-lan78xx \
+kmod-usb-net-aqc111 \
+kmod-usb-net-mcs7830 kmod-usb-net-pegasus \
+kmod-usb-net-dm9601-ether kmod-usb-net-sr9700"
 PKGS="$PKGS_LUCI $PKGS_ZT $PKGS_USB"
 
 ZTCLI=""
 RETRIES=3
-VERSION="baseline-1.2"
+VERSION="baseline-1.3"
 
 log()  { printf '[+] %s\n' "$*"; }
 warn() { printf '[~] %s\n' "$*" >&2; }
@@ -27,7 +36,7 @@ ensure_time_sync() {
   [ -x /etc/init.d/sysntpd ] && { /etc/init.d/sysntpd enable >/dev/null 2>&1 || true; /etc/init.d/sysntpd start >/dev/null 2>&1 || true; }
 }
 
-# === WWAN DNS override (only if network.wwan exists) ===
+# WWAN DNS override (only if network.wwan exists)
 configure_wwan_dns() {
   if uci -q show network.wwan >/dev/null 2>&1; then
     uci set network.wwan.peerdns='0'
@@ -62,8 +71,8 @@ prompt_network_id_blocking() {
     if ! read ZT_NETWORK_ID < /dev/tty; then err "No TTY available for input."; exit 2; fi
     ZT_NETWORK_ID="$(printf '%s' "$ZT_NETWORK_ID" | tr -d ' \t\r\n' | tr 'A-F' 'a-f')"
     case "$ZT_NETWORK_ID" in
-      *[!0-9a-f]*|"") echo "Invalid network ID. Must be 16 hex chars." > /dev/tty;;
-      *) if [ ${#ZT_NETWORK_ID} -ne 16 ]; then echo "Must be exactly 16 chars." > /dev/tty; else export ZT_NETWORK_ID; break; fi;;
+      *[!0-9a-f]*|"") echo "Invalid network ID. Must be 16 hex chars." > /dev/tty ;;
+      *) if [ ${#ZT_NETWORK_ID} -ne 16 ]; then echo "Must be exactly 16 chars." > /dev/tty; else export ZT_NETWORK_ID; break; fi ;;
     esac
   done
 }
@@ -100,7 +109,6 @@ ensure_zerotier_running() {
     detect_ztcli
   fi
   [ -n "$ZTCLI" ] || { err "zerotier-cli not found."; return 1; }
-  uci_enable_zerotier
   [ -x /etc/init.d/zerotier ] && { /etc/init.d/zerotier enable || true; /etc/init.d/zerotier restart || /etc/init.d/zerotier start || true; }
   retry 5 "$ZTCLI" info >/dev/null 2>&1 || { err "ZeroTier service not responding to '$ZTCLI info'."; return 1; }
   return 0
@@ -118,7 +126,7 @@ join_zerotier() {
   echo
 }
 
-# === NEW in 1.2: fetch zerotiersetup.sh via curl and chmod +x ===
+# Fetch zerotiersetup.sh and make it executable (as in 1.2)
 fetch_zt_setup() {
   if ! command -v curl >/dev/null 2>&1; then
     log "Installing curl + CA certs for HTTPS fetch..."
@@ -139,17 +147,21 @@ fetch_zt_setup() {
 main() {
   log "Version: $VERSION"
   log "Ensuring time sync..."; ensure_time_sync
-
   configure_wwan_dns
 
   log "Updating package lists..."; retry "$RETRIES" opkg update || { err "opkg update failed"; exit 1; }
   [ -f /var/lock/opkg.lock ] && { err "Another opkg process is running (opkg.lock present)."; exit 1; }
 
   for p in $PKGS; do
-    if is_installed "$p"; then log "Package '$p' already installed; skipping."
+    if is_installed "$p"; then
+      log "Package '$p' already installed; skipping."
     else
-      if pkg_available "$p"; then log "Installing '$p'..."; retry "$RETRIES" opkg install "$p" || { err "Failed to install '$p'"; exit 1; }
-      else warn "Package '$p' not available for this target; skipping."; fi
+      if pkg_available "$p"; then
+        log "Installing '$p'..."
+        retry "$RETRIES" opkg install "$p" || { err "Failed to install '$p'"; exit 1; }
+      else
+        warn "Package '$p' not available for this target; skipping."
+      fi
     fi
   done
 
@@ -159,7 +171,6 @@ main() {
   prompt_network_id_blocking
   join_zerotier || true
 
-  # NEW in 1.2: pull down zerotiersetup.sh
   fetch_zt_setup || true
 
   LAN_IP="$(get_lan_ip || true)"
