@@ -1,87 +1,37 @@
 #!/bin/ash
 # OpenWrt 24.10.0 (RPi5) — LuCI + extras + ZeroTier (ash-safe)
-# Baseline 1.4 = 1.3 + driver installs are OPTIONAL (skip on error)
+# Baseline 1.2 = Baseline 1.1 + fetch zerotiersetup.sh via curl
+#                + expanded USB/Ethernet driver set
 
 set -eu
 
 PKGS_LUCI="luci luci-ssl luci-compat luci-app-opkg"
 PKGS_ZT="zerotier"
-# Consolidated USB + NIC drivers (OPTIONAL)
+# Expanded USB/Ethernet drivers (your requested set)
 PKGS_USB="\
 kmod-usb-core kmod-usb-uhci kmod-usb-ohci kmod-usb2 kmod-usb3 \
 usbutils nano ethtool \
 kmod-rt2x00-lib kmod-rt2x00-usb kmod-rt2800-lib kmod-rt2800-usb \
 kmod-usb-net-cdc-ether kmod-usb-net-rndis kmod-usb-net-cdc-ncm \
-kmod-usb-net-ax88179-178a kmod-usb-net-asix-ax88179 kmod-usb-net-asix \
+kmod-usb-net-ax88179-178a kmod-usb-net-asix kmod-usb-net-asix-ax88179 \
 kmod-usb-net-rtl8152 kmod-usb-net-rtl8150 \
 kmod-usb-net-smsc95xx kmod-usb-net-lan78xx \
 kmod-usb-net-aqc111 \
 kmod-usb-net-mcs7830 kmod-usb-net-pegasus \
 kmod-usb-net-dm9601-ether kmod-usb-net-sr9700"
-
-PKGS_REQUIRED="$PKGS_LUCI $PKGS_ZT"
-PKGS="$PKGS_REQUIRED $PKGS_USB"
+PKGS="$PKGS_LUCI $PKGS_ZT $PKGS_USB"
 
 ZTCLI=""
 RETRIES=3
-VERSION="baseline-1.4"
+VERSION="baseline-1.2"
 
 log()  { printf '[+] %s\n' "$*"; }
 warn() { printf '[~] %s\n' "$*" >&2; }
 err()  { printf '[!] %s\n' "$*" >&2; }
 
-retry() { _t="$1"; shift; n=1; while :; do if "$@"; then return 0; fi; [ $n -ge "$_t" ] && return 1; n=$((n+1)); sleep 2; done; }
+retry() { _t="$1"; shift; n=1; while :; do if "$@"; then return 0; fi; [ $n -ge $_t ] && return 1; n=$((n+1)); sleep 2; done; }
 is_installed() { opkg list-installed | grep -q "^$1 -"; }
 pkg_available() { opkg info "$1" >/dev/null 2>&1; }
-
-alt_names() {
-  # echo space-separated fallback names for a package (if any)
-  case "$1" in
-    kmod-usb-net-ax88179-178a) echo "kmod-usb-net-asix-ax88179 kmod-usb-net-asix" ;;
-    *) echo "" ;;
-  esac
-}
-
-install_required() {
-  p="$1"
-  if is_installed "$p"; then log "Package '$p' already installed; skipping."; return 0; fi
-  if ! pkg_available "$p"; then err "Required package '$p' not available for this target."; exit 1; fi
-  log "Installing required '$p'..."
-  retry "$RETRIES" opkg install "$p" || { err "Failed to install required '$p'"; exit 1; }
-}
-
-install_optional() {
-  p="$1"
-  # already installed?
-  if is_installed "$p"; then log "Package '$p' already installed; skipping."; return 0; fi
-  # if available, try install
-  if pkg_available "$p"; then
-    log "Installing '$p'..."
-    if retry "$RETRIES" opkg install "$p"; then
-      return 0
-    else
-      warn "Failed to install '$p' (optional); will try fallbacks if defined."
-    fi
-  else
-    warn "Package '$p' not available (optional)."
-  fi
-  # try fallbacks (if any)
-  for alt in $(alt_names "$p"); do
-    if is_installed "$alt"; then log "Fallback '$alt' already installed; skipping."; return 0; fi
-    if pkg_available "$alt"; then
-      log "Installing fallback '$alt' for '$p'..."
-      if retry "$RETRIES" opkg install "$alt"; then
-        return 0
-      else
-        warn "Failed to install fallback '$alt' (optional)."
-      fi
-    else
-      warn "Fallback '$alt' not available."
-    fi
-  done
-  warn "Giving up on '$p' (optional). Continuing."
-  return 0
-}
 
 ensure_time_sync() {
   [ -x /etc/init.d/sysntpd ] && { /etc/init.d/sysntpd enable >/dev/null 2>&1 || true; /etc/init.d/sysntpd start >/dev/null 2>&1 || true; }
@@ -160,6 +110,7 @@ ensure_zerotier_running() {
     detect_ztcli
   fi
   [ -n "$ZTCLI" ] || { err "zerotier-cli not found."; return 1; }
+  uci_enable_zerotier
   [ -x /etc/init.d/zerotier ] && { /etc/init.d/zerotier enable || true; /etc/init.d/zerotier restart || /etc/init.d/zerotier start || true; }
   retry 5 "$ZTCLI" info >/dev/null 2>&1 || { err "ZeroTier service not responding to '$ZTCLI info'."; return 1; }
   return 0
@@ -182,35 +133,39 @@ fetch_zt_setup() {
   if ! command -v curl >/dev/null 2>&1; then
     log "Installing curl + CA certs for HTTPS fetch..."
     retry "$RETRIES" opkg install curl ca-bundle ca-certificates || {
-      warn "Failed to install curl/CA certs; skipping zerotiersetup.sh download."
+      err "Failed to install curl/CA certs; cannot fetch zerotiersetup.sh automatically."
       return 1
     }
   fi
   log "Downloading zerotiersetup.sh..."
-  if retry "$RETRIES" sh -c 'curl -fsSLO https://raw.githubusercontent.com/spicy-rhino/openwrt-zerotier/main/zerotiersetup.sh'; then
-    chmod +x zerotiersetup.sh
-    log "zerotiersetup.sh downloaded and made executable."
-  else
-    warn "curl download failed; skipping."
-  fi
+  retry "$RETRIES" sh -c 'curl -fsSLO https://raw.githubusercontent.com/spicy-rhino/openwrt-zerotier/main/zerotiersetup.sh' || {
+    err "curl download failed."
+    return 1
+  }
+  chmod +x zerotiersetup.sh
+  log "zerotiersetup.sh downloaded and made executable."
 }
 
 main() {
   log "Version: $VERSION"
   log "Ensuring time sync..."; ensure_time_sync
+
   configure_wwan_dns
 
   log "Updating package lists..."; retry "$RETRIES" opkg update || { err "opkg update failed"; exit 1; }
   [ -f /var/lock/opkg.lock ] && { err "Another opkg process is running (opkg.lock present)."; exit 1; }
 
-  # Install REQUIRED packages (fail on error)
-  for p in $PKGS_LUCI $PKGS_ZT; do
-    install_required "$p"
-  done
-
-  # Install OPTIONAL USB/NIC drivers (do NOT fail script)
-  for p in $PKGS_USB; do
-    install_optional "$p" || true
+  for p in $PKGS; do
+    if is_installed "$p"; then
+      log "Package '$p' already installed; skipping."
+    else
+      if pkg_available "$p"; then
+        log "Installing '$p'..."
+        retry "$RETRIES" opkg install "$p" || { err "Failed to install '$p'"; exit 1; }
+      else
+        warn "Package '$p' not available for this target; skipping."
+      fi
+    fi
   done
 
   [ -x /etc/init.d/uhttpd ] && { /etc/init.d/uhttpd enable || true; /etc/init.d/uhttpd restart || /etc/init.d/uhttpd start || true; }
