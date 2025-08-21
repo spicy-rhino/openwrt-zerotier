@@ -1,25 +1,19 @@
 #!/bin/ash
 # OpenWrt 24.10.0 (RPi5) — LuCI + extras + ZeroTier
 # Baseline 1.2 = Baseline 1.1 + fetch zerotiersetup.sh via curl
-#              + expanded USB/Ethernet drivers
-#              + tiny hardening: ensure a Zerotier UCI section exists & enabled
+#              + tiny hardening: ensure a ZeroTier UCI section exists & enabled
+#              + ORIGINAL USB adapter set (no extra chipsets)
 
 set -eu
 
 PKGS_LUCI="luci luci-ssl luci-compat luci-app-opkg"
 PKGS_ZT="zerotier"
-# Expanded USB/Ethernet drivers (your requested set)
+# Original USB/Ethernet + Wi-Fi driver set
 PKGS_USB="\
-kmod-usb-core kmod-usb-uhci kmod-usb-ohci kmod-usb2 kmod-usb3 \
-usbutils nano ethtool \
-kmod-rt2x00-lib kmod-rt2x00-usb kmod-rt2800-lib kmod-rt2800-usb \
-kmod-usb-net-cdc-ether kmod-usb-net-rndis kmod-usb-net-cdc-ncm \
-kmod-usb-net-ax88179-178a kmod-usb-net-asix kmod-usb-net-asix-ax88179 \
-kmod-usb-net-rtl8152 kmod-usb-net-rtl8150 \
-kmod-usb-net-smsc95xx kmod-usb-net-lan78xx \
-kmod-usb-net-aqc111 \
-kmod-usb-net-mcs7830 kmod-usb-net-pegasus \
-kmod-usb-net-dm9601-ether kmod-usb-net-sr9700"
+kmod-rt2800-lib kmod-rt2800-usb kmod-rt2x00-lib kmod-rt2x00-usb \
+kmod-usb-core kmod-usb-uhci kmod-usb-ohci kmod-usb2 \
+usbutils nano \
+kmod-usb-net-asix-ax88179 kmod-usb-net-cdc-ether kmod-usb-net-rndis"
 PKGS="$PKGS_LUCI $PKGS_ZT $PKGS_USB"
 
 ZTCLI=""
@@ -92,12 +86,10 @@ detect_ztcli() {
   export ZTCLI
 }
 
-# --- Tiny hardening: guarantee /etc/config/zerotier has an enabled section ---
+# Tiny hardening: ensure a zerotier section exists and is enabled
 uci_force_enable_zerotier() {
   uci -q show zerotier >/dev/null 2>&1 || uci add zerotier zerotier >/dev/null
-  # ensure at least one section exists
   if ! uci -q get zerotier.@zerotier[0].enabled >/dev/null 2>&1; then
-    # if no [0] section, add one
     [ -n "$(uci -q show zerotier | sed -n 's/^zerotier\.\([^.]*\)=zerotier.*/\1/p' | head -n1)" ] || uci add zerotier zerotier >/dev/null
   fi
   uci set zerotier.@zerotier[0].enabled='1'
