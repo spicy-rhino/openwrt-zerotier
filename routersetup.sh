@@ -13,7 +13,8 @@ PKGS_USB="\
 kmod-rt2800-lib kmod-rt2800-usb kmod-rt2x00-lib kmod-rt2x00-usb \
 kmod-usb-core kmod-usb-uhci kmod-usb-ohci kmod-usb2 \
 usbutils nano \
-kmod-usb-net-asix-ax88179 kmod-usb-net-cdc-ether kmod-usb-net-rndis"
+kmod-usb-net-asix-ax88179 kmod-usb-net-cdc-ether kmod-usb-net-rndis \
+kmod-usb-net-rtl8152"
 PKGS="$PKGS_LUCI $PKGS_ZT $PKGS_USB"
 
 ZTCLI=""
