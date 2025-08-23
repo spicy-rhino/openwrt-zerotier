@@ -162,22 +162,16 @@ main() {
         warn "Package '$p' not available for this target; skipping."
       fi
     fi
-# --- USB preferred over WWAN with mwan3 (fixed, idempotent) ---
+# --- Single USB WAN preferred over WWAN (no mwan3, no hotplug) ---
 
 set -eu
 
-# 0) Packages
-opkg update
-opkg install mwan3 || true
-opkg install luci-app-mwan3 || true
-
-# 1) Pick the USB NIC device (first USB-backed eth*, or fallback to eth1)
+# 1) Detect the first USB-backed ethernet (falls back to eth1 if none found yet)
 USB_DEV="${USB_WAN_DEV:-}"
 if [ -z "${USB_DEV}" ]; then
   for p in /sys/class/net/eth*; do
     [ -e "$p" ] || continue
     IF="$(basename "$p")"
-    # USB NICs show a /sys path that includes '/usb'
     if readlink -f "/sys/class/net/$IF/device" 2>/dev/null | grep -q '/usb'; then
       USB_DEV="$IF"
       break
@@ -185,27 +179,26 @@ if [ -z "${USB_DEV}" ]; then
   done
 fi
 USB_DEV="${USB_DEV:-eth1}"
-echo "[+] USB WAN device chosen: $USB_DEV"
+echo "[+] USB WAN device: $USB_DEV"
 
-# 2) Define USB WAN (wan_usb1) on $USB_DEV; prefer it with a low route metric
+# 2) Create/refresh a single USB WAN interface (DHCP), preferred via low metric
 uci -q get network.wan_usb1 >/dev/null || { uci add network interface; uci rename network.@interface[-1]='wan_usb1'; }
 uci set network.wan_usb1.proto='dhcp'
 uci set network.wan_usb1.device="$USB_DEV"
-uci set network.wan_usb1.metric='10'
 uci set network.wan_usb1.peerdns='1'
 uci set network.wan_usb1.defaultroute='1'
+uci set network.wan_usb1.metric='10'
 uci set network.wan_usb1.hostname='openwrt'
 
-# Make WWAN a fallback (if present) via higher metric
+# 3) Make WWAN a fallback if it exists (higher metric)
 if uci -q show network.wwan >/dev/null 2>&1; then
   uci set network.wwan.metric='100'
 fi
 uci commit network
 
-# 3) Firewall: ensure exactly ONE 'wan' zone; merge & delete duplicates if any
+# 4) Ensure exactly ONE firewall zone named 'wan'; merge duplicates; attach wan, wan_usb1, (wwan if present)
 WAN_ZONES="$(uci show firewall | sed -n 's/^firewall\.\([^=]*\)=zone.*/\1/p' \
   | while read s; do [ "$(uci -q get firewall.$s.name)" = "wan" ] && echo "$s"; done || true)"
-
 PRIMARY_WAN_ZONE="$(echo "$WAN_ZONES" | head -n1)"
 EXTRA_WAN_ZONES="$(echo "$WAN_ZONES" | tail -n +2)"
 
@@ -217,10 +210,8 @@ if [ -z "${PRIMARY_WAN_ZONE}" ]; then
   uci set firewall.$PRIMARY_WAN_ZONE.output='ACCEPT'
 fi
 
-# Merge any extra 'wan' zones into the primary and delete them
 if [ -n "${EXTRA_WAN_ZONES}" ]; then
   for z in $EXTRA_WAN_ZONES; do
-    # carry over networks (if any)
     for n in $(uci -q get firewall.$z.network 2>/dev/null | tr ' ' '\n'); do
       uci add_list firewall.$PRIMARY_WAN_ZONE.network="$n" 2>/dev/null || true
     done
@@ -228,82 +219,22 @@ if [ -n "${EXTRA_WAN_ZONES}" ]; then
   done
 fi
 
-# Attach expected networks to the single WAN zone (idempotent), then de-dup
-for IFN in wan wan_usb1 wwan; do
-  uci -q show network.$IFN >/dev/null 2>&1 || continue
-  uci add_list firewall.$PRIMARY_WAN_ZONE.network="$IFN" 2>/dev/null || true
-done
+# Attach networks to the single WAN zone (idempotent), then de-dup
+uci add_list firewall.$PRIMARY_WAN_ZONE.network='wan'        2>/dev/null || true
+uci add_list firewall.$PRIMARY_WAN_ZONE.network='wan_usb1'   2>/dev/null || true
+uci -q show network.wwan >/dev/null 2>&1 && uci add_list firewall.$PRIMARY_WAN_ZONE.network='wwan' 2>/dev/null || true
+
 NLIST="$(uci -q get firewall.$PRIMARY_WAN_ZONE.network 2>/dev/null | tr ' ' '\n' | awk ' !seen[$0]++ ')"
 uci -q delete firewall.$PRIMARY_WAN_ZONE.network
 for n in $NLIST; do uci add_list firewall.$PRIMARY_WAN_ZONE.network="$n"; done
 uci commit firewall
 /etc/init.d/firewall restart || true
 
-# 4) Minimal mwan3 policy: USB (wan_usb1) -> WWAN failover with health checks
-cat >/etc/config/mwan3 <<'EOF'
-config globals 'globals'
-        option mmx_mask '0x3F00'
-        option flush_conntrack_on_policy_switch '1'
-
-config interface 'wan_usb1'
-        option enabled '1'
-        option family 'ipv4'
-        list track_ip '1.1.1.1'
-        list track_ip '8.8.8.8'
-        option reliability '1'
-        option interval '5'
-        option down '3'
-        option up '2'
-        option initial_state 'online'
-        option timeout '2'
-        option failure_interval '5'
-        option recovery_interval '5'
-
-config interface 'wwan'
-        option enabled '1'
-        option family 'ipv4'
-        list track_ip '1.1.1.1'
-        list track_ip '8.8.4.4'
-        option reliability '1'
-        option interval '5'
-        option down '3'
-        option up '2'
-        option initial_state 'online'
-        option timeout '2'
-        option failure_interval '5'
-        option recovery_interval '5'
-
-config member 'm_wan_usb1'
-        option interface 'wan_usb1'
-        option metric '10'
-        option weight '1'
-
-config member 'm_wwan'
-        option interface 'wwan'
-        option metric '20'
-        option weight '1'
-
-config policy 'usb_primary'
-        list use_member 'm_wan_usb1'
-        list use_member 'm_wwan'
-
-config rule 'default_rule'
-        option dest_ip '0.0.0.0/0'
-        option proto 'all'
-        option use_policy 'usb_primary'
-EOF
-
-# 5) Enable & start mwan3; bounce network to run DHCP if USB NIC is present
-/etc/init.d/mwan3 enable
-/etc/init.d/mwan3 restart || true
+# 5) Restart network so DHCP runs on the USB NIC if present; show default routes
 /etc/init.d/network restart || true
-
-# 6) Sanity checks
-echo "=== fw4 check ==="
-fw4 check || true
-echo "=== mwan3 status ==="
-mwan3 status 2>/dev/null || true
-echo "[+] USB WAN is '$USB_DEV' -> interface 'wan_usb1'; WWAN is fallback if present."
+sleep 2
+echo "=== default routes (lower metric preferred) ==="
+ip -4 route show default || true
 
   done
 
