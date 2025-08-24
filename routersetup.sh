@@ -147,6 +147,17 @@ main() {
   log "Ensuring time sync..."; ensure_time_sync
 
   configure_wwan_dns
+  
+  log "Configuring WAN on eth1..."
+  uci set network.wan.device='eth1'
+  uci set network.wan.proto='dhcp'
+  uci set network.wan.metric='10'
+  if uci -q show network.wwan >/dev/null 2>&1; then
+    uci set network.wwan.metric='100'
+  fi
+  uci commit network
+  /etc/init.d/network restart >/dev/null 2>&1 || true
+  log "WAN bound to eth1 (metric 10), WWAN fallback (metric 100 if present)."
 
   log "Updating package lists..."; retry "$RETRIES" opkg update || { err "opkg update failed"; exit 1; }
   [ -f /var/lock/opkg.lock ] && { err "Another opkg process is running (opkg.lock present)."; exit 1; }
