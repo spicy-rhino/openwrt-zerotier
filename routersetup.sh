@@ -148,16 +148,29 @@ main() {
 
   configure_wwan_dns
   
+   # --- Simple: force WAN = eth1, WWAN as fallback (create wan if missing) ---
   log "Configuring WAN on eth1..."
-  uci set network.wan.device='eth1'
+  uci -q get network.wan >/dev/null || { uci add network interface >/dev/null; uci rename network.@interface[-1]='wan'; }
   uci set network.wan.proto='dhcp'
+  uci set network.wan.device='eth1'
   uci set network.wan.metric='10'
   if uci -q show network.wwan >/dev/null 2>&1; then
     uci set network.wwan.metric='100'
   fi
+  # ensure a firewall 'wan' zone exists and contains the 'wan' interface
+  WAN_ZONE="$(uci show firewall | sed -n 's/^firewall\.\([^=]*\)=zone.*/\1/p' | while read s; do [ "$(uci -q get firewall.$s.name)" = "wan" ] && echo "$s"; done | head -n1)"
+  if [ -z "$WAN_ZONE" ]; then
+    WAN_ZONE="$(uci add firewall zone)"
+    uci set firewall.$WAN_ZONE.name='wan'
+    uci set firewall.$WAN_ZONE.input='REJECT'
+    uci set firewall.$WAN_ZONE.forward='REJECT'
+    uci set firewall.$WAN_ZONE.output='ACCEPT'
+  fi
+  uci add_list firewall.$WAN_ZONE.network='wan' 2>/dev/null
   uci commit network
+  uci commit firewall
   /etc/init.d/network restart >/dev/null 2>&1 || true
-  log "WAN bound to eth1 (metric 10), WWAN fallback (metric 100 if present)."
+  log "WAN bound to eth1 (metric 10); WWAN fallback (metric 100 if present)."
 
   log "Updating package lists..."; retry "$RETRIES" opkg update || { err "opkg update failed"; exit 1; }
   [ -f /var/lock/opkg.lock ] && { err "Another opkg process is running (opkg.lock present)."; exit 1; }
