@@ -183,9 +183,12 @@ main() {
     uci set network.wwan.metric='100'
   fi
 
-  # Ensure a single firewall 'wan' zone exists and references 'wan' (not wan_usb1)
-  WAN_ZONE="$(uci show firewall | sed -n 's/^firewall\.\([^=]*\)=zone.*/\1/p' \
-    | while read s; do [ "$(uci -q get firewall.$s.name)" = "wan" ] && echo "$s"; done | head -n1)"
+  # Find (or create) the single firewall 'wan' zone safely
+  WAN_ZONE=""
+  for sec in $(uci show firewall 2>/dev/null | sed -n 's/^firewall\.\([^=]*\)=zone.*/\1/p'); do
+    name="$(uci -q get firewall.$sec.name 2>/dev/null || echo '')"
+    [ "$name" = "wan" ] && { WAN_ZONE="$sec"; break; }
+  done
   if [ -z "$WAN_ZONE" ]; then
     WAN_ZONE="$(uci add firewall zone)"
     uci set firewall.$WAN_ZONE.name='wan'
