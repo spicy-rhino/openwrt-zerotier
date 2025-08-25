@@ -8,7 +8,7 @@ set -eu
 
 PKGS_LUCI="luci luci-ssl luci-compat luci-app-opkg"
 PKGS_ZT="zerotier"
-# Original USB/Ethernet + Wi-Fi driver set (includes Realtek RTL8152/8153)
+# Original USB/Ethernet + Wi-Fi driver set (includes RTL8152/8153)
 PKGS_USB="\
 kmod-rt2800-lib kmod-rt2800-usb kmod-rt2x00-lib kmod-rt2x00-usb \
 kmod-usb-core kmod-usb-uhci kmod-usb-ohci kmod-usb2 \
@@ -25,12 +25,24 @@ log()  { printf '[+] %s\n' "$*"; }
 warn() { printf '[~] %s\n' "$*" >&2; }
 err()  { printf '[!] %s\n' "$*" >&2; }
 
-retry() { _t="$1"; shift; n=1; while :; do if "$@"; then return 0; fi; [ $n -ge $_t ] && return 1; n=$((n+1)); sleep 2; done; }
+retry() {
+  _t="$1"; shift
+  n=1
+  while :; do
+    if "$@"; then return 0; fi
+    if [ "$n" -ge "$_t" ]; then return 1; fi
+    n=$((n+1))
+    sleep 2
+  done
+}
 is_installed() { opkg list-installed | grep -q "^$1 -"; }
 pkg_available() { opkg info "$1" >/dev/null 2>&1; }
 
 ensure_time_sync() {
-  [ -x /etc/init.d/sysntpd ] && { /etc/init.d/sysntpd enable >/dev/null 2>&1 || true; /etc/init.d/sysntpd start >/dev/null 2>&1 || true; }
+  if [ -x /etc/init.d/sysntpd ]; then
+    /etc/init.d/sysntpd enable >/dev/null 2>&1 || true
+    /etc/init.d/sysntpd start  >/dev/null 2>&1 || true
+  fi
 }
 
 # WWAN DNS override (only if network.wwan exists)
@@ -49,7 +61,8 @@ configure_wwan_dns() {
 
 get_lan_ip() {
   if ip -4 addr show br-lan >/dev/null 2>&1; then
-    ip -4 addr show br-lan | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1; return
+    ip -4 addr show br-lan | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1
+    return
   fi
   ip -4 addr show | awk '/inet /{print $2}' | cut -d/ -f1 \
     | awk '/^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)/{print; exit}'
@@ -69,7 +82,14 @@ prompt_network_id_blocking() {
     ZT_NETWORK_ID="$(printf '%s' "$ZT_NETWORK_ID" | tr -d ' \t\r\n' | tr 'A-F' 'a-f')"
     case "$ZT_NETWORK_ID" in
       *[!0-9a-f]*|"") echo "Invalid network ID. Must be 16 hex chars." > /dev/tty ;;
-      *) if [ ${#ZT_NETWORK_ID} -ne 16 ]; then echo "Must be exactly 16 chars." > /dev/tty; else export ZT_NETWORK_ID; break; fi ;;
+      *)
+        if [ ${#ZT_NETWORK_ID} -ne 16 ]; then
+          echo "Must be exactly 16 chars." > /dev/tty
+        else
+          export ZT_NETWORK_ID
+          break
+        fi
+      ;;
     esac
   done
 }
@@ -105,9 +125,12 @@ ensure_zerotier_running() {
     retry "$RETRIES" opkg install zerotier || { err "Failed to install 'zerotier'."; return 1; }
     detect_ztcli
   fi
-  [ -n "$ZTCLI" ] || { err "zerotier-cli not found."; return 1; }
+  if [ -z "$ZTCLI" ]; then err "zerotier-cli not found."; return 1; fi
   uci_force_enable_zerotier
-  [ -x /etc/init.d/zerotier ] && { /etc/init.d/zerotier enable || true; /etc/init.d/zerotier restart || /etc/init.d/zerotier start || true; }
+  if [ -x /etc/init.d/zerotier ]; then
+    /etc/init.d/zerotier enable  || true
+    /etc/init.d/zerotier restart || /etc/init.d/zerotier start || true
+  fi
   retry 5 "$ZTCLI" info >/dev/null 2>&1 || { err "ZeroTier service not responding to '$ZTCLI info'."; return 1; }
   return 0
 }
@@ -194,8 +217,14 @@ main() {
     fi
   done
 
-  [ -x /etc/init.d/uhttpd ] && { /etc/init.d/uhttpd enable || true; /etc/init.d/uhttpd restart || /etc/init.d/uhttpd start || true; }
-  [ -x /etc/init.d/rpcd ]   && { /etc/init.d/rpcd   enable || true; /etc/init.d/rpcd   restart || /etc/init.d/rpcd   start || true; }
+  if [ -x /etc/init.d/uhttpd ]; then
+    /etc/init.d/uhttpd enable  || true
+    /etc/init.d/uhttpd restart || /etc/init.d/uhttpd start || true
+  fi
+  if [ -x /etc/init.d/rpcd ]; then
+    /etc/init.d/rpcd enable  || true
+    /etc/init.d/rpcd restart || /etc/init.d/rpcd start || true
+  fi
 
   prompt_network_id_blocking
   join_zerotier || true
