@@ -171,10 +171,29 @@ main() {
 
   configure_wwan_dns
 
-  # --- Simple: force WAN = eth1, WWAN fallback; remove any old wan_usb1 ---
+  # --- Install packages FIRST (so USB NIC driver is present) ---
+  log "Updating package lists..."; retry "$RETRIES" opkg update || { err "opkg update failed"; exit 1; }
+  [ -f /var/lock/opkg.lock ] && { err "Another opkg process is running (opkg.lock present)."; exit 1; }
+  for p in $PKGS; do
+    if is_installed "$p"; then
+      log "Package '$p' already installed; skipping."
+    else
+      if pkg_available "$p"; then
+        log "Installing '$p'..."
+        retry "$RETRIES" opkg install "$p" || { err "Failed to install '$p'"; exit 1; }
+      else
+        warn "Package '$p' not available for this target; skipping."
+      fi
+    fi
+  done
+  # Nudge the Realtek driver to load now (harmless if already loaded/missing)
+  if [ -e "/lib/modules/$(uname -r)/r8152.ko" ]; then
+    (modprobe r8152 2>/dev/null || insmod /lib/modules/$(uname -r)/r8152.ko 2>/dev/null || true)
+  fi
+
+  # --- Now bind WAN to eth1; remove any old wan_usb1; set WWAN fallback ---
   log "Configuring WAN on eth1..."
   uci -q delete network.wan_usb1
-
   uci -q get network.wan >/dev/null || { uci add network interface >/dev/null; uci rename network.@interface[-1]='wan'; }
   uci set network.wan.proto='dhcp'
   uci set network.wan.device='eth1'
@@ -183,7 +202,7 @@ main() {
     uci set network.wwan.metric='100'
   fi
 
-  # Find (or create) the single firewall 'wan' zone safely
+  # Ensure a single firewall 'wan' zone exists and references 'wan'
   WAN_ZONE=""
   for sec in $(uci show firewall 2>/dev/null | sed -n 's/^firewall\.\([^=]*\)=zone.*/\1/p'); do
     name="$(uci -q get firewall.$sec.name 2>/dev/null || echo '')"
@@ -203,22 +222,6 @@ main() {
   uci commit firewall
   /etc/init.d/network restart >/dev/null 2>&1 || true
   log "WAN bound to eth1 (metric 10); WWAN fallback (metric 100 if present)."
-
-  log "Updating package lists..."; retry "$RETRIES" opkg update || { err "opkg update failed"; exit 1; }
-  [ -f /var/lock/opkg.lock ] && { err "Another opkg process is running (opkg.lock present)."; exit 1; }
-
-  for p in $PKGS; do
-    if is_installed "$p"; then
-      log "Package '$p' already installed; skipping."
-    else
-      if pkg_available "$p"; then
-        log "Installing '$p'..."
-        retry "$RETRIES" opkg install "$p" || { err "Failed to install '$p'"; exit 1; }
-      else
-        warn "Package '$p' not available for this target; skipping."
-      fi
-    fi
-  done
 
   if [ -x /etc/init.d/uhttpd ]; then
     /etc/init.d/uhttpd enable  || true
