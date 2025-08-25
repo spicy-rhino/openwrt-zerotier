@@ -93,4 +93,125 @@ uci_force_enable_zerotier() {
   if ! uci -q get zerotier.@zerotier[0].enabled >/dev/null 2>&1; then
     [ -n "$(uci -q show zerotier | sed -n 's/^zerotier\.\([^.]*\)=zerotier.*/\1/p' | head -n1)" ] || uci add zerotier zerotier >/dev/null
   fi
-  uci set zero
+  uci set zerotier.@zerotier[0].enabled='1'
+  uci commit zerotier
+}
+
+ensure_zerotier_running() {
+  detect_ztcli
+  if [ -z "$ZTCLI" ]; then
+    log "Installing ZeroTier..."
+    retry "$RETRIES" opkg update || true
+    retry "$RETRIES" opkg install zerotier || { err "Failed to install 'zerotier'."; return 1; }
+    detect_ztcli
+  fi
+  [ -n "$ZTCLI" ] || { err "zerotier-cli not found."; return 1; }
+  uci_force_enable_zerotier
+  [ -x /etc/init.d/zerotier ] && { /etc/init.d/zerotier enable || true; /etc/init.d/zerotier restart || /etc/init.d/zerotier start || true; }
+  retry 5 "$ZTCLI" info >/dev/null 2>&1 || { err "ZeroTier service not responding to '$ZTCLI info'."; return 1; }
+  return 0
+}
+
+join_zerotier() {
+  log "Joining ZeroTier network: $ZT_NETWORK_ID"
+  ensure_zerotier_running || { err "ZeroTier isn't running; cannot join."; return 1; }
+  retry "$RETRIES" "$ZTCLI" join "$ZT_NETWORK_ID" || { err "Failed to join $ZT_NETWORK_ID"; return 1; }
+  sleep 2
+  "$ZTCLI" listnetworks | grep "$ZT_NETWORK_ID" || true
+  echo
+  echo "If the network requires controller authorization, approve this node in the ZeroTier web UI."
+  echo "Leave later:  $ZTCLI leave $ZT_NETWORK_ID"
+  echo
+}
+
+# Fetch zerotiersetup.sh and make it executable
+fetch_zt_setup() {
+  if ! command -v curl >/dev/null 2>&1; then
+    log "Installing curl + CA certs for HTTPS fetch..."
+    retry "$RETRIES" opkg install curl ca-bundle ca-certificates || {
+      err "Failed to install curl/CA certs; cannot fetch zerotiersetup.sh automatically."
+      return 1
+    }
+  fi
+  log "Downloading zerotiersetup.sh..."
+  retry "$RETRIES" sh -c 'curl -fsSLO https://raw.githubusercontent.com/spicy-rhino/openwrt-zerotier/main/zerotiersetup.sh' || {
+    err "curl download failed."
+    return 1
+  }
+  chmod +x zerotiersetup.sh
+  log "zerotiersetup.sh downloaded and made executable."
+}
+
+main() {
+  log "Version: $VERSION"
+  log "Ensuring time sync..."; ensure_time_sync
+
+  configure_wwan_dns
+
+  # --- Simple: force WAN = eth1, WWAN fallback; remove any old wan_usb1 ---
+  log "Configuring WAN on eth1..."
+  uci -q delete network.wan_usb1
+
+  uci -q get network.wan >/dev/null || { uci add network interface >/dev/null; uci rename network.@interface[-1]='wan'; }
+  uci set network.wan.proto='dhcp'
+  uci set network.wan.device='eth1'
+  uci set network.wan.metric='10'
+  if uci -q show network.wwan >/dev/null 2>&1; then
+    uci set network.wwan.metric='100'
+  fi
+
+  # Ensure a single firewall 'wan' zone exists and references 'wan' (not wan_usb1)
+  WAN_ZONE="$(uci show firewall | sed -n 's/^firewall\.\([^=]*\)=zone.*/\1/p' \
+    | while read s; do [ "$(uci -q get firewall.$s.name)" = "wan" ] && echo "$s"; done | head -n1)"
+  if [ -z "$WAN_ZONE" ]; then
+    WAN_ZONE="$(uci add firewall zone)"
+    uci set firewall.$WAN_ZONE.name='wan'
+    uci set firewall.$WAN_ZONE.input='REJECT'
+    uci set firewall.$WAN_ZONE.forward='REJECT'
+    uci set firewall.$WAN_ZONE.output='ACCEPT'
+  fi
+  uci add_list firewall.$WAN_ZONE.network='wan' 2>/dev/null
+  uci -q delete_list firewall.$WAN_ZONE.network='wan_usb1'
+
+  uci commit network
+  uci commit firewall
+  /etc/init.d/network restart >/dev/null 2>&1 || true
+  log "WAN bound to eth1 (metric 10); WWAN fallback (metric 100 if present)."
+
+  log "Updating package lists..."; retry "$RETRIES" opkg update || { err "opkg update failed"; exit 1; }
+  [ -f /var/lock/opkg.lock ] && { err "Another opkg process is running (opkg.lock present)."; exit 1; }
+
+  for p in $PKGS; do
+    if is_installed "$p"; then
+      log "Package '$p' already installed; skipping."
+    else
+      if pkg_available "$p"; then
+        log "Installing '$p'..."
+        retry "$RETRIES" opkg install "$p" || { err "Failed to install '$p'"; exit 1; }
+      else
+        warn "Package '$p' not available for this target; skipping."
+      fi
+    fi
+  done
+
+  [ -x /etc/init.d/uhttpd ] && { /etc/init.d/uhttpd enable || true; /etc/init.d/uhttpd restart || /etc/init.d/uhttpd start || true; }
+  [ -x /etc/init.d/rpcd ]   && { /etc/init.d/rpcd   enable || true; /etc/init.d/rpcd   restart || /etc/init.d/rpcd   start || true; }
+
+  prompt_network_id_blocking
+  join_zerotier || true
+
+  fetch_zt_setup || true
+
+  LAN_IP="$(get_lan_ip || true)"
+  log "Done."
+  echo
+  if [ -n "${LAN_IP:-}" ]; then
+    echo "LuCI Web UI (HTTP):  http://${LAN_IP}/"
+    echo "LuCI Web UI (HTTPS): https://${LAN_IP}/"
+    echo "Next: run ./zerotiersetup.sh to bridge ZeroTier into br-lan."
+  else
+    echo "LuCI Web UI is up on LAN (IP not auto-detected)."
+  fi
+}
+
+main "$@"
