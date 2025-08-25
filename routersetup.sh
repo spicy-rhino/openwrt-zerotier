@@ -171,7 +171,7 @@ main() {
 
   configure_wwan_dns
 
-  # --- Install packages FIRST (so USB NIC driver is present) ---
+  # 1) Install packages FIRST (driver present & loaded)
   log "Updating package lists..."; retry "$RETRIES" opkg update || { err "opkg update failed"; exit 1; }
   [ -f /var/lock/opkg.lock ] && { err "Another opkg process is running (opkg.lock present)."; exit 1; }
   for p in $PKGS; do
@@ -186,12 +186,12 @@ main() {
       fi
     fi
   done
-  # Nudge the Realtek driver to load now (harmless if already loaded/missing)
+  # Try to load r8152 now (harmless if not present)
   if [ -e "/lib/modules/$(uname -r)/r8152.ko" ]; then
     (modprobe r8152 2>/dev/null || insmod /lib/modules/$(uname -r)/r8152.ko 2>/dev/null || true)
   fi
 
-  # --- Now bind WAN to eth1; remove any old wan_usb1; set WWAN fallback ---
+  # 2) Bind WAN to eth1; remove any old wan_usb1; set WWAN fallback
   log "Configuring WAN on eth1..."
   uci -q delete network.wan_usb1
   uci -q get network.wan >/dev/null || { uci add network interface >/dev/null; uci rename network.@interface[-1]='wan'; }
@@ -201,8 +201,9 @@ main() {
   if uci -q show network.wwan >/dev/null 2>&1; then
     uci set network.wwan.metric='100'
   fi
+  uci commit network
 
-  # Ensure a single firewall 'wan' zone exists and references 'wan'
+  # Ensure firewall 'wan' zone references 'wan'
   WAN_ZONE=""
   for sec in $(uci show firewall 2>/dev/null | sed -n 's/^firewall\.\([^=]*\)=zone.*/\1/p'); do
     name="$(uci -q get firewall.$sec.name 2>/dev/null || echo '')"
@@ -217,12 +218,14 @@ main() {
   fi
   uci add_list firewall.$WAN_ZONE.network='wan' 2>/dev/null
   uci -q delete_list firewall.$WAN_ZONE.network='wan_usb1'
-
-  uci commit network
   uci commit firewall
-  /etc/init.d/network restart >/dev/null 2>&1 || true
-  log "WAN bound to eth1 (metric 10); WWAN fallback (metric 100 if present)."
 
+  # Bring up WAN ONLY (avoid full restart that kills SSH)
+  ifup wan || ubus call network.interface.wan up >/dev/null 2>&1 || true
+  sleep 2
+  log "WAN ifup attempted on eth1."
+
+  # 3) Bring up system services (no network restart)
   if [ -x /etc/init.d/uhttpd ]; then
     /etc/init.d/uhttpd enable  || true
     /etc/init.d/uhttpd restart || /etc/init.d/uhttpd start || true
@@ -232,10 +235,12 @@ main() {
     /etc/init.d/rpcd restart || /etc/init.d/rpcd start || true
   fi
 
+  # 4) Fetch helper script
+  fetch_zt_setup || true
+
+  # 5) Prompt & join ZeroTier LAST (no restarts after this)
   prompt_network_id_blocking
   join_zerotier || true
-
-  fetch_zt_setup || true
 
   LAN_IP="$(get_lan_ip || true)"
   log "Done."
