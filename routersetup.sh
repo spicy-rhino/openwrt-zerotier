@@ -33,6 +33,8 @@ ensure_time_sync() {
   [ -x /etc/init.d/sysntpd ] && { /etc/init.d/sysntpd enable >/dev/null 2>&1 || true; /etc/init.d/sysntpd start >/dev/null 2>&1 || true; }
 }
 
+opkg install kmod-usb-net-rtl8152
+
 # WWAN DNS override (only if network.wwan exists)
 configure_wwan_dns() {
   if uci -q show network.wwan >/dev/null 2>&1; then
